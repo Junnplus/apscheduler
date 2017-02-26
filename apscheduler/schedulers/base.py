@@ -908,6 +908,45 @@ class BaseScheduler(six.with_metaclass(ABCMeta)):
         """Creates a reentrant lock object."""
         return RLock()
 
+    def _submit_job(self, executor, job, run_times, now=None):
+        """Submit job to executor.
+        :param apscheduler.executors.base.BaseExecutor executor: an executor instance
+        :param Job job: a job instance
+        """
+        events = []
+        jobstore_alias = job._jobstore_alias
+        jobstore = self._lookup_jobstore(jobstore_alias)
+        try:
+            executor.submit_job(job, run_times)
+        except MaxInstancesReachedError:
+            self._logger.warning(
+                'Execution of job "%s" skipped: maximum number of running '
+                'instances reached (%d)', job, job.max_instances)
+            event = JobSubmissionEvent(EVENT_JOB_MAX_INSTANCES, job.id,
+                                       jobstore_alias, run_times)
+            events.append(event)
+        except:
+            self._logger.exception('Error submitting job "%s" to executor "%s"',
+                                   job, job.executor)
+        else:
+            event = JobSubmissionEvent(EVENT_JOB_SUBMITTED, job.id, jobstore_alias,
+                                       run_times)
+            events.append(event)
+
+        # Update the job if it has a next execution time.
+        # Otherwise remove it from the job store.
+        now = now if now is not None else datetime.now(self.timezone)
+        job_next_run = job.trigger.get_next_fire_time(run_times[-1], now)
+        if job_next_run:
+            job._modify(next_run_time=job_next_run)
+            jobstore.update_job(job)
+        else:
+            self.remove_job(job.id, jobstore_alias)
+
+        # Dispatch collected events
+        for event in events:
+            self._dispatch_event(event)
+
     def _process_jobs(self):
         """
         Iterates through jobs in every jobstore, starts jobs that are due and figures out how long
@@ -924,7 +963,6 @@ class BaseScheduler(six.with_metaclass(ABCMeta)):
         self._logger.debug('Looking for jobs to run')
         now = datetime.now(self.timezone)
         next_wakeup_time = None
-        events = []
 
         with self._jobstores_lock:
             for jobstore_alias, jobstore in six.iteritems(self._jobstores):
@@ -954,31 +992,7 @@ class BaseScheduler(six.with_metaclass(ABCMeta)):
                     run_times = job._get_run_times(now)
                     run_times = run_times[-1:] if run_times and job.coalesce else run_times
                     if run_times:
-                        try:
-                            executor.submit_job(job, run_times)
-                        except MaxInstancesReachedError:
-                            self._logger.warning(
-                                'Execution of job "%s" skipped: maximum number of running '
-                                'instances reached (%d)', job, job.max_instances)
-                            event = JobSubmissionEvent(EVENT_JOB_MAX_INSTANCES, job.id,
-                                                       jobstore_alias, run_times)
-                            events.append(event)
-                        except:
-                            self._logger.exception('Error submitting job "%s" to executor "%s"',
-                                                   job, job.executor)
-                        else:
-                            event = JobSubmissionEvent(EVENT_JOB_SUBMITTED, job.id, jobstore_alias,
-                                                       run_times)
-                            events.append(event)
-
-                        # Update the job if it has a next execution time.
-                        # Otherwise remove it from the job store.
-                        job_next_run = job.trigger.get_next_fire_time(run_times[-1], now)
-                        if job_next_run:
-                            job._modify(next_run_time=job_next_run)
-                            jobstore.update_job(job)
-                        else:
-                            self.remove_job(job.id, jobstore_alias)
+                        self._submit_job(executor, job, run_times, now)
 
                 # Set a new next wakeup time if there isn't one yet or
                 # the jobstore has an even earlier one
@@ -986,10 +1000,6 @@ class BaseScheduler(six.with_metaclass(ABCMeta)):
                 if jobstore_next_run_time and (next_wakeup_time is None or
                                                jobstore_next_run_time < next_wakeup_time):
                     next_wakeup_time = jobstore_next_run_time.astimezone(self.timezone)
-
-        # Dispatch collected events
-        for event in events:
-            self._dispatch_event(event)
 
         # Determine the delay until this method should be called again
         if self.state == STATE_PAUSED:
